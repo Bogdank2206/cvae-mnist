@@ -21,34 +21,39 @@ Backend — API для инференса модели и обучения.
 
 ### Распределения
 
-- **Приор**: $p(z) = \mathcal{N}(0, I)$
-- **Лайклихуд**: $p(x \mid z) = \mathcal{N}(\mathrm{Decoder}(z), \sigma^2)$
+- **Приор**: $p(z) = \mathcal{N}(0, \sigma^{2} I)$ — дисперсия $\sigma^{2} =$ `PRIOR_VAR` ([config.py](server/app/config.py)), единая для всех латентных размерностей (диагональная ковариация); `PRIOR_VAR = 1.0` сводит к стандартному $\mathcal{N}(0, I)$
+- **Лайклихуд**: $p(x \mid z) = \mathrm{Bernoulli}(\mathrm{Decoder}(z))$ — каждый пиксель трактуется как независимая бернуллиевская величина, декодер через Sigmoid выдаёт вероятность
 - **Апостериорный аналог**: $q(z \mid x) = \mathcal{N}(\mu(x), \mathrm{diag}(\exp(\log\sigma^{2}(x))))$
-- **Loss**: $-\mathbb{E}_{q(z|x)}[\log p(x|z)] + D_{KL}(q(z|x) \| p(z))$ (т.е. −ELBO)
+- **Loss (как в [losses.py](server/app/services/losses.py))**: $\mathrm{BCE}(\hat{x}, x)_{\mathrm{mean}} + \beta \cdot D_{KL}(q(z|x) \| p(z))$, где $\beta =$ `kl_weight`. BCE соответствует $-\log p(x|z)$ для бернуллиевского лайклихуда; KL берётся суммой по латентным размерностям и средним по батчу. `kl_weight = 1.0` (без annealing, см. [train.py:35](server/train.py#L35))
 
 ### Энкодер (CNN₂)
 
-На входе тензор **2×28×28** (batch, channels, height, width):
+На входе тензор **11×28×28** (batch, channels, height, width):
 
 - Канал 0 — яркость пикселя (нормализованная [0, 1])
-- Канал 1 — условие: скаляр лейбла (0…9) повторённый на все пиксели без нормализации
+- Каналы 1–10 — one-hot лейбла: 10 бинарных каналов, каждый повторён на всё пространство 28×28
+
+Условие собирает `prepare_condition` в [services/data.py](server/app/services/data.py).
 
 Архитектура:
 
-1. Conv2d(2, **8**, kernel=3, padding=1) + ReLU + MaxPool2d(2×2) → 8×14×14
+1. Conv2d(11, **8**, kernel=3, padding=1) + ReLU + MaxPool2d(2×2) → 8×14×14
 2. Conv2d(8, **32**, kernel=3, padding=1) + ReLU + MaxPool2d(2×2) → 32×7×7
-3. Mean Pooling по пространственным измерениям (avg на 7×7) → вектор размерности 32
+3. Flatten → вектор размерности 32·7·7 = **1568**
 
-Результат: два вектора $\mu$, $\log\sigma^{2}$ размерности **latentDim=32**
+Результат: две `Linear`-головы (`mu_head`, `log_var_head`: 1568 → latent_dim) дают $\mu$ и $\log\sigma^{2}$ размерности **latent_dim = 128** (`LATENT_DIM` в [config.py](server/app/config.py)).
 
 ### Декодер (CNN₁)
 
-1. Сэмплирование $z = \mu + \varepsilon \cdot \exp(\tfrac{1}{2}\log\sigma^{2})$, $\varepsilon \sim \mathcal{N}(0, I)$ (reparameterization trick), + one-hot лейбл → конкатенация $[z, \mathrm{one\_hot}(\mathrm{label})]$
-2. Linear(42 → **49**) + reshape в **1×7×7**
-3. ConvTranspose2d(1, 4, kernel=3, stride=2, padding=1, output_padding=1) + ReLU → 4×14×14
-4. ConvTranspose2d(4, 1, kernel=3, stride=2, padding=1, output_padding=1) + Sigmoid → **1×28×28**
+Reparameterization trick живёт в [CVAE.forward](server/app/models/cvae.py#L20-L23): $z = \mu + \varepsilon \cdot \exp(\tfrac{1}{2}\log\sigma^{2})$, $\varepsilon \sim \mathcal{N}(0, I)$. Декодер получает уже готовый $z$.
 
-Декодер выдаёт только $\mu_{out}$ (матожидание выходной картинки) — $\sigma^2 = 1$ фиксировано.
+1. Конкатенация $[z, \mathrm{one\_hot}(\mathrm{label})]$ → вектор размерности **latent_dim + 10 = 138**
+2. Проекция `Linear(138 → 256)` + ReLU + `Linear(256 → 784)` + ReLU + reshape в **16×7×7**
+3. ConvTranspose2d(16, 32, kernel=3, stride=2, padding=1, output_padding=1) + ReLU → 32×14×14
+4. ConvTranspose2d(32, 16, kernel=3, stride=2, padding=1, output_padding=1) + ReLU → 16×28×28
+5. Conv2d(16, 1, kernel=3, padding=1) + Sigmoid → **1×28×28**
+
+Декодер выдаёт вероятность пикселя $\hat{x}$ (бернуллиевский параметр), что вместе с BCE-реконструкцией эквивалентно $-\log p(x|z)$.
 
 ### Инференс
 

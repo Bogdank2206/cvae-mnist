@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-from app.config import LATENT_DIM, MODEL_PATH
+from app.config import LATENT_DIM, MODEL_PATH, PRIOR_VAR
 from app.models.cvae import CVAE
 from app.services.image import tensor_to_base64_png
 
@@ -21,7 +21,7 @@ def load_model() -> None:
     if not MODEL_PATH.exists():
         logger.warning("Файл весов %s не найден — генерация невозможна", MODEL_PATH)
         return
-    _model = CVAE(latent_dim=LATENT_DIM)
+    _model = CVAE(latent_dim=LATENT_DIM, prior_var=PRIOR_VAR)
     state = torch.load(MODEL_PATH, map_location=_device, weights_only=True)
     _model.load_state_dict(state)
     _model.eval()
