@@ -32,7 +32,7 @@ def train(args: argparse.Namespace) -> None:
 
     model.train()
     for epoch in range(1, args.epochs + 1):
-        kl_weight = 0.05 * epoch / args.epochs if epoch > 10 else 0        
+        kl_weight = 0.05 * epoch / args.epochs if epoch > args.epochs / 2 else 0        
         total_loss = 0.0
         total_recon = 0.0
         total_kl = 0.0
