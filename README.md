@@ -22,56 +22,6 @@ Frontend — интерактивный UI для генерации цифр п
 | Модель   | Conditional VAE (CNN), MNIST                                                       |
 | Данные   | `ylecun/mnist` из Hugging Face (`datasets`)                                        |
 
-## Архитектура модели
-
-Условный VAE: лейбл подаётся и в энкодер (как one-hot каналы), и в декодер (как one-hot вектор).
-
-**Энкодер** — вход `11×28×28` (канал 0 — яркость пикселя, каналы 1–10 — one-hot лейбла,
-размноженный на всё пространство):
-
-`Conv2d(11→8, k3, p1)+ReLU+MaxPool` → 8×14×14 → `Conv2d(8→32, k3, p1)+ReLU+MaxPool` → 32×7×7 →
-`Flatten` (1568) → две головы `Linear(1568→latent_dim)`: `mu` и `log_var`.
-
-**Reparameterization** (`CVAE.forward`): `z = mu + ε·exp(½·log_var)`, `ε ~ N(0, I)`.
-
-**Декодер** — `concat[z, one_hot(label)]` (`latent_dim + 10`) → `Linear(→256)+ReLU` →
-`Linear(→784)+ReLU` → reshape `16×7×7` → `ConvT(16→32, s2)+ReLU` → 32×14×14 →
-`ConvT(32→16, s2)+ReLU` → 16×28×28 → `Conv2d(16→1, k3, p1)+Sigmoid` → `1×28×28`.
-
-**Инференс** использует только декодер: `z ~ N(0, prior_var·I)` + лейбл → вероятность пикселя.
-
-**Loss**: `BCE(x̂, x) + β·KL`, где `β = kl_weight` (KL-annealing — см. [train.py:35](server/train.py#L35)).
-KL считается в общем виде для априори `N(0, prior_var·I)` (лог-член нужен при `prior_var ≠ 1`),
-суммируется по латентным осям и усредняется по батчу ([losses.py](server/app/services/losses.py)).
-
-Параметры по умолчанию заданы в [config.py](server/app/config.py): `LATENT_DIM=32`, `PRIOR_VAR=1.0`.
-
-## Структура репозитория
-
-```
-client/                     # React + Vite + TS (UI генерации)
-  src/
-    components/             # UI-компоненты
-    hooks/                  # Кастомные хуки
-    api/                    # Клиент для backend-эндпоинтов
-    types/                  # Shared типы (TS)
-server/                     # FastAPI + PyTorch
-  app/
-    api/                    # Роуты (FastAPI routers)
-    models/                 # CVAE: encoder.py, decoder.py, cvae.py
-    schemas/                # Pydantic-схемы ввода/вывода
-    services/               # Инференс, загрузка данных, лоссы
-    config.py               # Пути, латентная размерность, prior_var, хост/порт
-  main.py                   # Точка входа FastAPI
-  train.py                  # CLI-скрипт обучения модели
-  requirements.txt
-  weights/                  # Чекпоинты модели (.pt) — в .gitignore
-compose.yaml                # server + client + nginx-прокси + trainer (обучение)
-nginx.conf                  # Роутинг: localhost → фронт, api.localhost → бэк
-.env / .env.example         # CORS_ORIGINS, VITE_API_URL (шаблон коммитится)
-CLAUDE.md                   # Архитектура модели и правила кода
-```
-
 ## Быстрый старт
 
 Веса модели в `.gitignore`, поэтому в репозитории их нет: первый запуск состоит из двух этапов —
@@ -158,3 +108,130 @@ CORS-origin'ы и URL API берутся из `.env` (шаблон — [.env.exa
 
 Параметры обучения (`--epochs`, `--batch-size`, `--lr`) — у [train.py](server/train.py).
 CORS-origin'ы и URL API для клиента задаются в `.env` (`CORS_ORIGINS`, `VITE_API_URL`, шаблон — [.env.example](.env.example)); сервер читает их через [config.py](server/app/config.py).
+
+## Структура репозитория
+
+```
+client/                     # React + Vite + TS (UI генерации)
+  src/
+    components/             # UI-компоненты
+    hooks/                  # Кастомные хуки
+    api/                    # Клиент для backend-эндпоинтов
+    types/                  # Shared типы (TS)
+server/                     # FastAPI + PyTorch
+  app/
+    api/                    # Роуты (FastAPI routers)
+    models/                 # CVAE: encoder.py, decoder.py, cvae.py
+    schemas/                # Pydantic-схемы ввода/вывода
+    services/               # Инференс, загрузка данных, лоссы
+    config.py               # Пути, латентная размерность, prior_var, хост/порт
+  main.py                   # Точка входа FastAPI
+  train.py                  # CLI-скрипт обучения модели
+  requirements.txt
+  weights/                  # Чекпоинты модели (.pt) — в .gitignore
+compose.yaml                # server + client + nginx-прокси + trainer (обучение)
+nginx.conf                  # Роутинг: localhost → фронт, api.localhost → бэк
+.env / .env.example         # CORS_ORIGINS, VITE_API_URL (шаблон коммитится)
+CLAUDE.md                   # Архитектура модели и правила кода
+```
+
+## Архитектура модели
+
+Условный VAE: лейбл $y \in \{0,\dots,9\}$ подаётся и в энкодер (как one-hot каналы), и в декодер
+(как one-hot вектор). Латентная размерность $d = $ `LATENT_DIM` $= 32$, дисперсия априори
+$\sigma^{2} = $ `PRIOR_VAR` $= 1.0$ ([config.py](server/app/config.py)).
+
+### Распределения
+
+| Компонент               | Формула                                                                                                |
+| ----------------------- | ------------------------------------------------------------------------------------------------------ |
+| Априор                  | $p(z) = \mathcal{N}\!\left(0,\ \sigma^{2} I\right)$                                                    |
+| Лайклихуд               | $p(x \mid z, y) = \mathrm{Bernoulli}\!\left(x \mid \hat{x}\right)$, $\hat{x} = \mathrm{Decoder}(z, y)$ |
+| Вариационный апостериор | $q(z \mid x, y) = \mathcal{N}\!\left(\mu(x, y),\ \mathrm{diag}\, e^{\log\sigma^{2}(x, y)}\right)$      |
+
+Каждый пиксель трактуется как независимая бернуллиевская величина, поэтому декодер через Sigmoid
+выдаёт вероятность пикселя $\hat{x} \in [0,1]^{1\times28\times28}$.
+
+### Reparameterization trick
+
+Сэмплирование $z$ сделано дифференцируемым ([cvae.py](server/app/models/cvae.py)):
+
+$$
+z = \mu(x, y) + \varepsilon \odot e^{\tfrac{1}{2}\log\sigma^{2}(x, y)}, \qquad \varepsilon \sim \mathcal{N}(0, I)
+$$
+
+### Функция потерь (ELBO)
+
+$$
+\mathcal{L}(x, y) = \underbrace{\mathrm{BCE}(\hat{x}, x)}_{\displaystyle -\log p(x \mid z, y)} \;+\; \beta\, D_{KL}\!\left(q(z \mid x, y)\,\|\, p(z)\right)
+$$
+
+KL берётся в замкнутом виде для диагональных гауссиан с неединственным априорном
+([losses.py](server/app/services/losses.py)); сумма по латентным осям, среднее по батчу:
+
+$$
+D_{KL} = \frac{1}{2} \sum_{j=1}^{d} \left( \ln\sigma^{2} \;-\; \log\sigma_{j}^{2} \;+\; \frac{e^{\log\sigma_{j}^{2}}}{\sigma^{2}} \;+\; \frac{\mu_{j}^{2}}{\sigma^{2}} \;-\; 1 \right)
+$$
+
+Здесь $\log\sigma_{j}^{2}$ и $\mu_{j}$ — выходы энкодера (лог-дисперсия и среднее $j$-й латентной
+оси), $\sigma^{2}$ — дисперсия априора. При $\sigma^{2} = 1$ лог-член $\ln\sigma^{2}$ обнуляется и
+формула сводится к стандартному KL для $\mathcal{N}(0, I)$. $\beta = $ `kl_weight`.
+
+### KL-annealing
+
+Вес $\beta$ — не константа, а задержанное линейное расписание ([train.py:35](server/train.py#L35)):
+
+$$
+\beta(e) = \begin{cases} 0, & e \le E/2 \\[4pt] 0.05\,\dfrac{e}{E}, & e > E/2 \end{cases}
+$$
+
+где $e$ — номер эпохи, $E$ — всего эпох. Первую половину обучения оптимизируется чистая
+реконструкция, затем $\beta$ линейно растёт примерно до $0.05$.
+
+**Зачем это нужно.** Если бы $\beta = 1$ с первой эпохи, оптимизатору было бы выгоднее всего
+мгновенно «обнулить» KL-член — столкнуть $q(z \mid x, y)$ к априору независимо от входа $x$. Латент перестаёт нести информацию, энкодер фактически
+игнорируется, и модель вырождается в обычный автоэнкодер, где декодер реконструирует картинку
+только по лейблу $y$. Это явление — **posterior collapse** (коллапс апостериора). Держа
+$\beta \approx 0$ в начале, мы сначала заставляем энкодер и декодер научиться осмысленной
+реконструкции и «привязаться» к $z$; KL-давление, прижимающее $z$ к $\mathcal{N}(0,\ \sigma^{2} I)$,
+включается лишь позже — к этому моменту модель уже не готова отказаться от латента.
+
+### Кодирование условия
+
+Энкодер получает 11-канальный тензор $x_{\text{in}} \in \mathbb{R}^{B \times 11 \times 28 \times 28}$
+([data.py](server/app/services/data.py)):
+
+- канал $0$ — яркость пикселя, нормализованная в $[0,1]$;
+- каналы $1\dots10$ — $\mathrm{onehot}(y)$, размноженный на всё пространство $28\times28$.
+
+### Энкодер (CNN₂)
+
+$$
+11{\times}28{\times}28 \xrightarrow{\;\text{Conv 3×3 (8), ReLU, MaxPool}\;} 8{\times}14{\times}14 \xrightarrow{\;\text{Conv 3×3 (32), ReLU, MaxPool}\;} 32{\times}7{\times}7 \xrightarrow{\;\text{Flatten}\;} \varphi \in \mathbb{R}^{1568}
+$$
+
+Две линейные головы без активации — $\log\sigma^{2}$ должно быть знакопеременной величиной:
+
+$$
+\mu = W_{\mu}\,\varphi + b_{\mu}, \qquad \log\sigma^{2} = W_{\sigma^{2}}\,\varphi + b_{\sigma^{2}}, \qquad \mu,\, \log\sigma^{2} \in \mathbb{R}^{d}
+$$
+
+### Декодер (CNN₁)
+
+$$
+[z;\, \mathrm{onehot}(y)] \in \mathbb{R}^{d+10} \xrightarrow{\;\text{Linear } (d{+}10 \to 256),\, \text{ReLU}\;} h_1 \xrightarrow{\;\text{Linear } (256 \to 784),\, \text{ReLU}\;} h_2 \xrightarrow{\;\text{reshape}\;} 16{\times}7{\times}7
+$$
+
+$$
+16{\times}7{\times}7 \xrightarrow{\;\text{ConvT } s{=}2 \text{ (32), ReLU}\;} 32{\times}14{\times}14 \xrightarrow{\;\text{ConvT } s{=}2 \text{ (16), ReLU}\;} 16{\times}28{\times}28 \xrightarrow{\;\text{Conv } 3{\times}3 \text{ (1), Sigmoid}\;} \hat{x}
+$$
+
+### Инференс (генерация)
+
+При генерации энкодер не нужен — сэмплируем из априора и декодируем conditioned на лейбле:
+
+$$
+z \sim \mathcal{N}\!\left(0,\ \sigma^{2} I\right), \qquad \hat{x} = \mathrm{Decoder}(z, y)
+$$
+
+Параметры по умолчанию — в [config.py](server/app/config.py): `LATENT_DIM = 32`, `PRIOR_VAR = 1.0`.
